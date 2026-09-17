@@ -6,3 +6,8 @@ manifests/
 results/
 venv/
 vllm/
+.DS_Store
+gcs-key.json
+
+# Raw result exports
+*.csv

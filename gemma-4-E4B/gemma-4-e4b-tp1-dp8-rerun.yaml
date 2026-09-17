@@ -1,0 +1,167 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gemma-4-e4b-tp1-dp8-rerun
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+        cloud.google.com/gke-tpu-topology: "2x4"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-tpu:nightly
+        args:
+        - "vllm"
+        - "serve"
+        - "google/gemma-4-E4B"
+        - "--tensor-parallel-size"
+        - "1"
+        - "--data-parallel-size"
+        - "8"
+        - "--dtype"
+        - "bfloat16"
+        - "--gpu-memory-utilization"
+        - "0.95"
+        - "--max-model-len"
+        - "512"
+        - "--max-num-batched-tokens"
+        - "8192"
+        - "--max-num-seqs"
+        - "128"
+        - "--enable-prefix-caching"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--trust-remote-code"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: USE_BATCHED_RPA_KERNEL
+          value: "1"
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "3600"
+        - name: TPU_MULTIPROCESS_DP
+          value: "true"
+        - name: SLICE_ROPE_CACHE
+          value: "true"
+        securityContext:
+          privileged: true
+        resources:
+          limits:
+            google.com/tpu: "8"
+          requests:
+            google.com/tpu: "8"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+      - name: native-bench-client
+        image: vllm/vllm-tpu:nightly
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/secret/key.json"
+        - name: JAX_PLATFORMS
+          value: "cpu"
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm || true' EXIT
+          
+          echo "Waiting for vLLM server..."
+          until curl -sf http://localhost:8000/health; do
+            sleep 5
+          done
+          echo "Server is ready. Starting native google/gemma-4-E4B benchmarks..."
+          
+          mkdir -p /workspace/output
+          echo "Installing google-cloud-storage upfront..."
+          pip install google-cloud-storage
+          
+          for concurrency in 1 2 4 8 16 32 48 64 96 128 160 192 256 320 384 512 640 768 1024; do
+            if [ "${concurrency}" -ge 96 ]; then
+              num_prompts=$((concurrency * 20))
+            else
+              num_prompts=1000
+            fi
+            echo "Running native benchmark with concurrency $concurrency, input len 450, prefix len 50, output len 1..."
+            if vllm bench serve \
+                --model google/gemma-4-E4B \
+                --dataset-name random \
+                --random-input-len 450 \
+                --random-prefix-len 50 \
+                --random-output-len 1 \
+                --random-range-ratio 0.0 \
+                --num-prompts ${num_prompts} \
+                --num-warmups 20 \
+                --max-concurrency $concurrency \
+                --metric-percentiles 50,90,95,99 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --save-result \
+                --result-dir /workspace/output \
+                --result-filename native_c${concurrency}_results.json \
+                --base-url http://localhost:8000; then
+              echo "Uploading native_c${concurrency}_results.json to GCS immediately..."
+              python3 -c "from google.cloud import storage; c = storage.Client(); b = c.bucket('llama-vllm-results-bucket'); b.blob('gemma-4-e4b-native-bench/v6e/tp1-dp8_rerun_results/native_c${concurrency}_results.json').upload_from_filename('/workspace/output/native_c${concurrency}_results.json')"
+            else
+              echo "WARNING: Benchmark failed or timed out at concurrency ${concurrency}, proceeding..."
+            fi
+          done
+          
+          echo "Final sync of all results to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+          
+          def upload_dir(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      local_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(local_path, local_dir)
+                      blob_path = os.path.join(gcs_prefix, rel_path)
+                      blob = bucket.blob(blob_path)
+                      blob.upload_from_filename(local_path)
+                      print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+          
+          upload_dir("llama-vllm-results-bucket", "/workspace/output", "gemma-4-e4b-native-bench/v6e/tp1-dp8_rerun_results")
+          '
+          echo "All results uploaded successfully."
+          pkill -f vllm || true
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: gcs-key
+          mountPath: /secret
+          readOnly: true
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+      - name: gcs-key
+        secret:
+          secretName: gcs-key

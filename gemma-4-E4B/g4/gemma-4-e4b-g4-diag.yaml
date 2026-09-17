@@ -1,0 +1,193 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gemma-4-e4b-g4-diag
+# DIAGNOSTIC, not a benchmark.
+#
+# The main E4B sweep showed measured throughput converging from above as run
+# duration grew: 900 req/s over 1.1s -> 650 req/s over 31.5s. Two explanations
+# were confounded, because the client raises num_prompts at the same
+# concurrency where throughput fell:
+#
+#   (a) DURATION effect  - burst capacity that decays under sustained load
+#                          (prefix-cache eviction churn, or power/thermal).
+#   (b) CONCURRENCY cliff - something real between c=64 and c=96.
+#
+# This job breaks the confound with a 2x2 over {c=64, c=96} x {short, long}:
+#
+#                 num_prompts=1000 (~1s)   num_prompts=20480 (~30s)
+#   c=64                  A                          B
+#   c=96                  C                          D
+#
+#   A vs B  isolates duration at fixed concurrency.
+#   A vs C  isolates concurrency at fixed (short) duration.
+#
+# If B ~= 650 and C ~= 900, the effect is duration-driven and sustained
+# throughput is the honest number. If B ~= 900 and C ~= 585, there is a real
+# cliff at c>64 and the sweep's shape needs a different explanation.
+#
+# Server config is byte-identical to gemma-4-e4b-g4-tp1-dp8.yaml so results
+# are directly comparable to the main run.
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-rtx-pro-6000"
+        cloud.google.com/gke-nodepool: "g4-384-pool"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-openai:nightly
+        command:
+        - "vllm"
+        args:
+        - "serve"
+        - "google/gemma-4-E4B"
+        - "--tensor-parallel-size"
+        - "1"
+        - "--data-parallel-size"
+        - "8"
+        - "--dtype"
+        - "bfloat16"
+        - "--gpu-memory-utilization"
+        - "0.90"
+        - "--max-model-len"
+        - "512"
+        - "--max-num-batched-tokens"
+        - "8192"
+        - "--max-num-seqs"
+        - "512"
+        - "--enable-prefix-caching"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--trust-remote-code"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: "spawn"
+        - name: NCCL_DEBUG
+          value: "WARN"
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+          requests:
+            nvidia.com/gpu: "8"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: dshm
+          mountPath: /dev/shm
+      - name: diag-client
+        image: vllm/vllm-openai:nightly
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/secret/key.json"
+        - name: CUDA_VISIBLE_DEVICES
+          value: ""
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm || true' EXIT
+
+          echo "Waiting for vLLM server..."
+          until curl -sf http://localhost:8000/health; do
+            sleep 5
+          done
+
+          mkdir -p /workspace/output
+          pip install google-cloud-storage
+
+          WARMUP_FLAG=""
+          if vllm bench serve --help 2>&1 | grep -q -- "--num-warmups"; then
+            WARMUP_FLAG="--num-warmups 20"
+          fi
+
+          # 2x2: concurrency x num_prompts. Cell A is the exact configuration
+          # that produced 900 req/s in the main sweep, re-run here as a control
+          # to confirm the effect reproduces at all.
+          run_cell () {
+            local name=$1 conc=$2 prompts=$3
+            echo "=== CELL ${name}: concurrency=${conc} num_prompts=${prompts} ==="
+            if vllm bench serve \
+                --model google/gemma-4-E4B \
+                --dataset-name random \
+                --random-input-len 450 \
+                --random-prefix-len 50 \
+                --random-output-len 1 \
+                --random-range-ratio 0.0 \
+                --num-prompts ${prompts} \
+                ${WARMUP_FLAG} \
+                --max-concurrency ${conc} \
+                --metric-percentiles 50,90,95,99 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --save-result \
+                --result-dir /workspace/output \
+                --result-filename diag_${name}_c${conc}_n${prompts}.json \
+                --base-url http://localhost:8000; then
+              python3 -c "from google.cloud import storage; c = storage.Client(); b = c.bucket('llama-vllm-results-bucket'); b.blob('gemma-4-e4b-native-bench/g4/diag_results/diag_${name}_c${conc}_n${prompts}.json').upload_from_filename('/workspace/output/diag_${name}_c${conc}_n${prompts}.json')"
+            else
+              echo "WARNING: cell ${name} failed, continuing..."
+            fi
+          }
+
+          # Interleaved so that any monotonic drift over the life of the job
+          # (e.g. thermal soak) cannot masquerade as a cell effect.
+          run_cell A 64 1000
+          run_cell C 96 1000
+          run_cell B 64 20480
+          run_cell D 96 20480
+          # Repeat the two short cells at the end: if A/C now read lower than
+          # they did at the start, the machine is heat-soaked and throttling is
+          # implicated rather than cache churn.
+          run_cell A2 64 1000
+          run_cell C2 96 1000
+
+          echo "Diagnostic complete."
+          pkill -f vllm || true
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: gcs-key
+          mountPath: /secret
+          readOnly: true
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: gcs-key
+        secret:
+          secretName: gcs-key

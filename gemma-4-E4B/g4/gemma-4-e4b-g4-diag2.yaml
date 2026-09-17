@@ -1,0 +1,250 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gemma-4-e4b-g4-diag2
+# DIAGNOSTIC 2 - prefix-cache attribution. Not a benchmark.
+#
+# BACKGROUND
+# The main E4B sweep peaked at 900 req/s (c=64, 1000 prompts, 1.1s) and settled
+# at ~650 req/s for c>=128. Diagnostic 1 (gemma-4-e4b-g4-diag) ruled out all
+# three of the obvious explanations:
+#
+#   concurrency cliff : REJECTED. c=64 -> c=96 raised throughput at both
+#                       durations (571.9 -> 676.2 long, 540.2 -> 636.7 short).
+#   duration effect   : REJECTED, and backwards. The 35.8s run beat the 1.85s
+#                       run at c=64; the 30.3s run beat the 1.57s run at c=96.
+#   thermal throttling: REJECTED. The repeat of cell A at the END of the job was
+#                       45% FASTER than at the start (373.5 -> 540.2), and C2 was
+#                       marginally faster than C. Nothing is heat-soaking.
+#
+# Diagnostic 1's best c=64 number was 571.9 req/s. It never reproduced 900.
+#
+# HYPOTHESIS UNDER TEST
+# `vllm bench serve --dataset-name random` derives prompts from a fixed seed, so
+# EVERY concurrency level in the sweep generates the IDENTICAL prompt set. The
+# sweep holds num_prompts=1000 for all c<96, so by the time it reaches c=64 those
+# same 1000 prompts have already been served seven times and are resident in the
+# prefix cache. E4B's KV cache measured 1,220,612 tokens = 2,441 prompts of 500
+# tokens, so 1000 prompts (500K tokens, 41% of capacity) fit with room to spare.
+# At c>=128 the client switches to num_prompts = c*20 >= 2,560 = 1.28M tokens,
+# which exceeds capacity, evicts continuously, and the cache stops paying.
+#
+# Corroborating evidence: the 31B sweep is perfectly smooth and monotonic. Its
+# KV cache measured only 31,209 tokens = 62 prompts, so it can NEVER cache the
+# prompt set at any concurrency. One mechanism explains both curve shapes.
+#
+# DESIGN
+# Everything is held fixed (server, concurrency=64, num_prompts=1000) and only
+# the dataset SEED is varied. The server is warmed first so that the cold-start
+# effect seen in diagnostic 1 cell A cannot contaminate the first measured cell.
+#
+#   W   seed 999  warm the server, populate cache with THROWAWAY prompts
+#   P1  seed 0    first sight of the seed-0 prompt set   -> cache COLD
+#   P2  seed 0    identical prompts to P1                -> cache WARM
+#   P3  seed 0    identical again                        -> cache WARM
+#   P4  seed 777  fresh prompts, same size/shape         -> cache COLD  (CONTROL)
+#   P5  seed 0    back to the P1/P2/P3 set               -> cache WARM
+#
+# PREDICTIONS
+#   If prefix caching is the mechanism:
+#       P1 ~ 540, P2 ~ P3 ~ 900, P4 ~ 540, P5 ~ 900   (sawtooth tracking the seed)
+#       prefix cache hit rate ~0% on P1/P4, high on P2/P3/P5.
+#   If it is not:
+#       P1 ~ P2 ~ P3 ~ P4 ~ P5, and the hit rate stays flat.
+#
+# P4 is the control that distinguishes "cache warm" from "server warm": it runs
+# LATER than P2/P3 but on unseen prompts, so any monotonic warm-up drift predicts
+# P4 >= P2, while the cache hypothesis predicts P4 << P2.
+#
+# Prometheus counters are sampled around every cell so the hit rate is measured
+# directly rather than inferred from throughput.
+#
+# Server config is byte-identical to gemma-4-e4b-g4-tp1-dp8.yaml.
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-rtx-pro-6000"
+        cloud.google.com/gke-nodepool: "g4-384-pool"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-openai:nightly
+        command:
+        - "vllm"
+        args:
+        - "serve"
+        - "google/gemma-4-E4B"
+        - "--tensor-parallel-size"
+        - "1"
+        - "--data-parallel-size"
+        - "8"
+        - "--dtype"
+        - "bfloat16"
+        - "--gpu-memory-utilization"
+        - "0.90"
+        - "--max-model-len"
+        - "512"
+        - "--max-num-batched-tokens"
+        - "8192"
+        - "--max-num-seqs"
+        - "512"
+        - "--enable-prefix-caching"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--trust-remote-code"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: "spawn"
+        - name: NCCL_DEBUG
+          value: "WARN"
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+          requests:
+            nvidia.com/gpu: "8"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: dshm
+          mountPath: /dev/shm
+      - name: diag-client
+        image: vllm/vllm-openai:nightly
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/secret/key.json"
+        - name: CUDA_VISIBLE_DEVICES
+          value: ""
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -x
+          trap 'pkill -f vllm || true' EXIT
+
+          echo "Waiting for vLLM server..."
+          until curl -sf http://localhost:8000/health; do
+            sleep 5
+          done
+
+          mkdir -p /workspace/output
+          pip install google-cloud-storage
+
+          # `--seed` is the whole point of this job; fail loudly if it is absent
+          # rather than silently running five identical cells.
+          if ! vllm bench serve --help 2>&1 | grep -q -- "--seed"; then
+            echo "FATAL: this vllm build has no --seed flag; diagnostic is invalid."
+            exit 1
+          fi
+
+          WARMUP_FLAG=""
+          if vllm bench serve --help 2>&1 | grep -q -- "--num-warmups"; then
+            WARMUP_FLAG="--num-warmups 20"
+          fi
+
+          # Sum the prefix-cache counters across all 8 DP engines.
+          pc_snapshot () {
+            curl -s http://localhost:8000/metrics | awk '
+              /^vllm:prefix_cache_queries_total/ {q+=$NF}
+              /^vllm:prefix_cache_hits_total/    {h+=$NF}
+              END {printf "%.0f %.0f\n", q, h}'
+          }
+
+          run_cell () {
+            local name=$1 seed=$2
+            local conc=64 prompts=1000
+            echo "=== CELL ${name}: seed=${seed} concurrency=${conc} num_prompts=${prompts} ==="
+
+            read Q0 H0 <<< "$(pc_snapshot)"
+
+            if vllm bench serve \
+                --model google/gemma-4-E4B \
+                --dataset-name random \
+                --random-input-len 450 \
+                --random-prefix-len 50 \
+                --random-output-len 1 \
+                --random-range-ratio 0.0 \
+                --num-prompts ${prompts} \
+                --seed ${seed} \
+                ${WARMUP_FLAG} \
+                --max-concurrency ${conc} \
+                --metric-percentiles 50,90,95,99 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --save-result \
+                --result-dir /workspace/output \
+                --result-filename diag2_${name}_seed${seed}.json \
+                --base-url http://localhost:8000; then
+
+              read Q1 H1 <<< "$(pc_snapshot)"
+              local dq=$((Q1 - Q0)) dh=$((H1 - H0))
+              local rate="n/a"
+              if [ "$dq" -gt 0 ]; then
+                rate=$(awk -v h="$dh" -v q="$dq" 'BEGIN{printf "%.1f%%", 100*h/q}')
+              fi
+              echo "PREFIX_CACHE ${name} seed=${seed} queries=${dq} hits=${dh} hit_rate=${rate}"
+
+              python3 -c "from google.cloud import storage; c = storage.Client(); b = c.bucket('llama-vllm-results-bucket'); b.blob('gemma-4-e4b-native-bench/g4/diag2_results/diag2_${name}_seed${seed}.json').upload_from_filename('/workspace/output/diag2_${name}_seed${seed}.json')"
+            else
+              echo "WARNING: cell ${name} failed, continuing..."
+            fi
+          }
+
+          # Warm the server on throwaway prompts so the cold-start penalty seen in
+          # diagnostic 1 (cell A was 45% slow) lands here and not on P1.
+          run_cell W 999
+
+          run_cell P1 0      # cache cold for this prompt set
+          run_cell P2 0      # cache warm  -> expect the jump toward 900
+          run_cell P3 0      # cache warm  -> expect stable
+          run_cell P4 777    # CONTROL: fresh prompts, latest in time -> expect drop
+          run_cell P5 0      # cache warm again -> expect recovery
+
+          echo "Diagnostic 2 complete."
+          echo "=== SUMMARY: grep for PREFIX_CACHE lines above ==="
+          pkill -f vllm || true
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: gcs-key
+          mountPath: /secret
+          readOnly: true
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 100Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: gcs-key
+        secret:
+          secretName: gcs-key

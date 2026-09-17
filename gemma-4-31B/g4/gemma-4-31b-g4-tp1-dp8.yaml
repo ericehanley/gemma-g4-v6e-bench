@@ -1,0 +1,214 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gemma-4-31b-g4-tp1-dp8
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-rtx-pro-6000"
+        # The g4-standard-48 node in this cluster carries the same accelerator
+        # label but only has 1 GPU, so pin to the 8-GPU pool explicitly.
+        cloud.google.com/gke-nodepool: "g4-384-pool"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-openai:nightly
+        command:
+        - "vllm"
+        args:
+        - "serve"
+        - "google/gemma-4-31B"
+        # RTX PRO 6000 Blackwell has 96GB GDDR7, so the 62.5GB BF16 weights fit on a
+        # single GPU. These cards have no NVLink (PCIe Gen5 only), so every TP
+        # all-reduce would cross PCIe. TP1 + DP8 therefore eliminates all
+        # cross-device collectives and runs 8 fully independent replicas.
+        - "--tensor-parallel-size"
+        - "1"
+        - "--data-parallel-size"
+        - "8"
+        - "--dtype"
+        - "bfloat16"
+        # 0.92 of ~95.5GiB = ~88GiB budget. Weights take 58.25GiB, leaving ~24GiB of
+        # KV cache (~110 fully-resident 512-token sequences) plus graph capture room.
+        - "--gpu-memory-utilization"
+        - "0.92"
+        # Workload is 450 random + 50 fixed prefix input tokens and 1 output token
+        # = 501. 512 is the smallest power of two that covers it.
+        - "--max-model-len"
+        - "512"
+        # Lowered from 8192 (the v6e value) to 4096. A G4 GPU delivers roughly half
+        # the dense BF16 throughput of a v6e chip, so an 8192-token prefill step would
+        # take ~1.5-2s and breach the 1s p90 SLO on its own. 4096 tokens is still
+        # 8 x 512-token prompts per step, which fully saturates the tensor cores.
+        - "--max-num-batched-tokens"
+        - "4096"
+        # MEASURED at runtime: 26.94 GiB KV cache = 31,209 tokens = 60.96
+        # concurrent 512-token sequences per replica.
+        #
+        # NOTE: 96 is above that ceiling and is therefore non-binding. The
+        # original estimate assumed `attention_k_eq_v: true` let vLLM store a
+        # single shared K/V tensor; it does not -- K and V caches are allocated
+        # separately, so the real cost is
+        #   (50*16*256 + 10*4*512) * 2 (K and V) * 2 bytes = 901,120 B/token,
+        # i.e. ~0.88 MiB/token, double the original figure.
+        #
+        # This does not affect results: with max-num-batched-tokens=4096 only
+        # ~8 prompts prefill per step and 1-token outputs retire immediately,
+        # so the running set stays far below 61 and the scheduler queues rather
+        # than preempts. Set to 56 for a cleaner future run.
+        - "--max-num-seqs"
+        - "96"
+        # The 50-token safety-policy prefix is shared by every request.
+        - "--enable-prefix-caching"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--trust-remote-code"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        # DP replicas are separate processes; spawn avoids CUDA fork issues.
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: "spawn"
+        - name: NCCL_DEBUG
+          value: "WARN"
+        - name: VLLM_LOGGING_LEVEL
+          value: "INFO"
+        resources:
+          limits:
+            nvidia.com/gpu: "8"
+          requests:
+            nvidia.com/gpu: "8"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        # The default 64MB /dev/shm is far too small for 8 DP engine processes.
+        - name: dshm
+          mountPath: /dev/shm
+      - name: native-bench-client
+        image: vllm/vllm-openai:nightly
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/secret/key.json"
+        # Keep the client off the GPUs entirely.
+        - name: CUDA_VISIBLE_DEVICES
+          value: ""
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm || true' EXIT
+
+          echo "Waiting for vLLM server (31B weights are ~62.5GB, first pull is slow)..."
+          until curl -sf http://localhost:8000/health; do
+            sleep 5
+          done
+          echo "Server is ready. Starting native google/gemma-4-31B benchmarks..."
+
+          mkdir -p /workspace/output
+          echo "Installing google-cloud-storage upfront..."
+          pip install google-cloud-storage
+
+          # The GPU image may not carry the same bench flags as the TPU image.
+          WARMUP_FLAG=""
+          if vllm bench serve --help 2>&1 | grep -q -- "--num-warmups"; then
+            WARMUP_FLAG="--num-warmups 20"
+          fi
+          echo "Using warmup flag: '${WARMUP_FLAG}'"
+
+          for concurrency in 1 2 4 8 16 24 32 48 64 80 96 128 160 192 256 320 384 512 640 768 1024; do
+            if [ "${concurrency}" -ge 96 ]; then
+              num_prompts=$((concurrency * 20))
+            else
+              num_prompts=1000
+            fi
+            echo "Running native benchmark with concurrency $concurrency, input len 450, prefix len 50, output len 1..."
+            if vllm bench serve \
+                --model google/gemma-4-31B \
+                --dataset-name random \
+                --random-input-len 450 \
+                --random-prefix-len 50 \
+                --random-output-len 1 \
+                --random-range-ratio 0.0 \
+                --num-prompts ${num_prompts} \
+                ${WARMUP_FLAG} \
+                --max-concurrency $concurrency \
+                --metric-percentiles 50,90,95,99 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --save-result \
+                --result-dir /workspace/output \
+                --result-filename native_c${concurrency}_results.json \
+                --base-url http://localhost:8000; then
+              echo "Uploading native_c${concurrency}_results.json to GCS immediately..."
+              python3 -c "from google.cloud import storage; c = storage.Client(); b = c.bucket('llama-vllm-results-bucket'); b.blob('gemma-4-31b-native-bench/g4/tp1-dp8_results/native_c${concurrency}_results.json').upload_from_filename('/workspace/output/native_c${concurrency}_results.json')"
+            else
+              echo "WARNING: Benchmark failed or timed out at concurrency ${concurrency}, proceeding..."
+            fi
+          done
+
+          echo "Final sync of all results to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+
+          def upload_dir(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      local_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(local_path, local_dir)
+                      blob_path = os.path.join(gcs_prefix, rel_path)
+                      blob = bucket.blob(blob_path)
+                      blob.upload_from_filename(local_path)
+                      print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+
+          upload_dir("llama-vllm-results-bucket", "/workspace/output", "gemma-4-31b-native-bench/g4/tp1-dp8_results")
+          '
+          echo "All results uploaded successfully."
+          pkill -f vllm || true
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: gcs-key
+          mountPath: /secret
+          readOnly: true
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      - name: gcs-key
+        secret:
+          secretName: gcs-key
