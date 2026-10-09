@@ -1,0 +1,153 @@
+# Customer replay on ONE TPU v6e chip (ct6e-standard-1t), the 1:1 counterpart of the G4 run in
+# ../../g4/customer_replay/ (one RTX PRO 6000 on g4-standard-48). Same data, same client, same
+# steps; only the accelerator and the CUDA-only server flags change. Logic: scripts/run_replay_v6e.sh.
+#
+# Runs in its own namespace (real user chat data; the default namespace is shared). The data is
+# streamed into the pod's tmpfs and never written to disk anywhere; results hold no text.
+#
+# Apply (from the repo root), in this order:
+#   kubectl apply -f gemma-4-E4B/v6e/customer_replay/rbx-replay-v6e.yaml      # namespace + SA first
+#   kubectl -n rbx-bench create secret generic hf-token \
+#     --from-literal=HF_TOKEN="$(kubectl -n default get secret hf-token -o jsonpath='{.data.HF_TOKEN}' | base64 -d)"
+#   kubectl -n rbx-bench create configmap rbx-replay-v6e-scripts \
+#     --from-file=gemma-4-E4B/g4/customer_replay/scripts/ \
+#     --from-file=gemma-4-E4B/v6e/customer_replay/scripts/ --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f gemma-4-E4B/v6e/customer_replay/rbx-replay-v6e.yaml      # now the Job schedules
+# (local/launch.sh does exactly this.)
+#
+# Once the server is up (progress.log: "server[V1]: healthy"), stream the dataset in with
+# local/stream.sh (identity check, stream, row-count gate, READY marker).
+#
+# When progress.log says ALL DONE:
+#   kubectl -n rbx-bench cp "$POD":/workspace/output gemma-4-E4B/v6e/customer_replay/results_run1_<node>
+#   kubectl -n rbx-bench exec "$POD" -- touch /workspace/output/RELEASE
+#   kubectl delete namespace rbx-bench
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rbx-bench
+  labels:
+    purpose: roblox-gemma4-benchmark
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rbx-bench
+  namespace: rbx-bench
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rbx-replay-v6e
+  namespace: rbx-bench
+spec:
+  backoffLimit: 0
+  # up to ~40 min first start (XLA compile) + ~2 h of steps + a 90 min copy-out window.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: rbx-replay-v6e
+    spec:
+      serviceAccountName: rbx-bench
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      nodeSelector:
+        # Pool is selectable (all ct6e-standard-1t, autoscale 0->1, us-central1-a/b/c):
+        #   v6e-1t-flex  flex-start (DWS); needs the gke-flex-start selector below   <- default
+        #   v6e-1t-spot  spot: the first attempt's node was preempted 30 min in
+        #   v6e-1t-od    on-demand: scale-up failed with "Invalid Reservation" (no on-demand quota/reservation)
+        cloud.google.com/gke-nodepool: "v6e-1t-flex"
+        cloud.google.com/gke-flex-start: "true"
+        cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+        # Required by GKE Warden for any TPU request; 1x1 is the single-host ct6e-standard-1t topology.
+        cloud.google.com/gke-tpu-topology: "1x1"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: replay
+        # vllm/vllm-tpu:nightly as of 2026-10-06T07:20Z = nightly-20261006-f5c194c-72e7874
+        # (tpu-inference f5c194c, vLLM 72e7874); the digest already pinned in ../../v6e_clean/.
+        image: vllm/vllm-tpu@sha256:625fd3f7bc4a79dab6489dd42e5f31a3679bad569433eeecd0bad30bb41d23c4
+        command: ["bash", "/scripts/run_replay_v6e.sh"]
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        # The customer's environment, verbatim (harmless on TPU; kept so the deviation list is short).
+        - name: OMP_NUM_THREADS
+          value: "8"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        # TPU server env, same as the earlier v6e manifests (gemma-4-E4B/gemma-4-e4b-tp1-dp8*.yaml).
+        - name: USE_BATCHED_RPA_KERNEL
+          value: "1"
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "3600"
+        - name: SLICE_ROPE_CACHE
+          value: "true"
+        # So `--middleware=gdm_binary_probability.GdmBinaryProbabilityMiddleware` imports from /scripts.
+        - name: PYTHONPATH
+          value: /scripts
+        - name: MODEL
+          value: google/gemma-4-E4B-it
+        # Bookkeeping only (versions.txt / progress.log).
+        - name: IMAGE_REF
+          value: "vllm/vllm-tpu@sha256:625fd3f7bc4a79dab6489dd42e5f31a3679bad569433eeecd0bad30bb41d23c4 (nightly-20261006-f5c194c-72e7874)"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        resources:
+          limits:
+            google.com/tpu: "1"
+          requests:
+            google.com/tpu: "1"
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+        - name: output
+          mountPath: /workspace/output
+        - name: data
+          mountPath: /data
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: scripts
+        configMap:
+          name: rbx-replay-v6e-scripts
+          defaultMode: 0555
+      - name: output
+        emptyDir: {}
+      # Dataset and rendered prompts: RAM only, gone with the pod.
+      - name: data
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+      # The checkpoint is ~16 GB; ct6e-standard-1t has 176 GiB of RAM.
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 40Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi

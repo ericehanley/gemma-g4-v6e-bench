@@ -1,0 +1,128 @@
+# Customer replay: safechat-100k against vLLM v0.30.0 with the customer's exact server flags
+# on ONE RTX PRO 6000 (g4-standard-48). Logic and step list are in scripts/run_replay.sh.
+#
+# Runs in its own namespace (real user chat data; the default namespace is shared). The data is
+# streamed into the pod's tmpfs and never written to disk anywhere; results hold no text.
+#
+# Apply (from the repo root), in this order:
+#   kubectl apply -f gemma-4-E4B/g4/customer_replay/rbx-replay.yaml          # namespace + SA first
+#   kubectl -n rbx-bench create secret generic hf-token \
+#     --from-literal=HF_TOKEN="$(kubectl -n default get secret hf-token -o jsonpath='{.data.HF_TOKEN}' | base64 -d)"
+#   kubectl -n rbx-bench create configmap rbx-replay-scripts \
+#     --from-file=gemma-4-E4B/g4/customer_replay/scripts/ --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f gemma-4-E4B/g4/customer_replay/rbx-replay.yaml          # now the Job schedules
+#
+# Once the server is up (progress.log: "server[customer]: healthy"), stream the dataset in:
+#   POD=$(kubectl -n rbx-bench get pods -l job-name=rbx-replay -o jsonpath='{.items[0].metadata.name}')
+#   venv/bin/python gemma-4-E4B/g4/customer_replay/stream_dataset.py | gzip -1 \
+#     | kubectl -n rbx-bench exec -i "$POD" -- sh -c 'gunzip > /data/safechat.jsonl && touch /data/READY'
+#
+# When progress.log says ALL DONE:
+#   kubectl -n rbx-bench cp "$POD":/workspace/output gemma-4-E4B/g4/customer_replay/results
+#   kubectl -n rbx-bench exec "$POD" -- touch /workspace/output/RELEASE
+#   kubectl delete namespace rbx-bench
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rbx-bench
+  labels:
+    purpose: roblox-gemma4-benchmark
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rbx-bench
+  namespace: rbx-bench
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rbx-replay
+  namespace: rbx-bench
+spec:
+  backoffLimit: 0
+  # ~15 min start + ~80 min of steps + a 90 min copy-out window, with headroom.
+  activeDeadlineSeconds: 18000
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: rbx-replay
+    spec:
+      serviceAccountName: rbx-bench
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-rtx-pro-6000"
+        cloud.google.com/gke-nodepool: "g4-48-spot-pool"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: replay
+        # vllm/vllm-openai:v0.30.0 (the customer's version), pinned by manifest-list digest.
+        image: vllm/vllm-openai@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90
+        command: ["bash", "/scripts/run_replay.sh"]
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        # The customer's environment, verbatim.
+        - name: OMP_NUM_THREADS
+          value: "8"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        # So `--middleware=gdm_binary_probability.GdmBinaryProbabilityMiddleware` imports from /scripts.
+        - name: PYTHONPATH
+          value: /scripts
+        - name: MODEL
+          value: google/gemma-4-E4B-it
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+          requests:
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+        - name: output
+          mountPath: /workspace/output
+        - name: data
+          mountPath: /data
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: scripts
+        configMap:
+          name: rbx-replay-scripts
+          defaultMode: 0555
+      - name: output
+        emptyDir: {}
+      # Dataset and rendered prompts: RAM only, gone with the pod.
+      - name: data
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+      # The checkpoint is ~16 GB; g4-standard-48 has ~166 GiB allocatable.
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 40Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi

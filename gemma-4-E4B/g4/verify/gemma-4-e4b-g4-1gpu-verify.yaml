@@ -1,0 +1,91 @@
+# HISTORICAL (2026-10-06), kept with verify_summary.md for provenance only: the scripts/ directory
+# it references was archived outside git on 2026-10-09, so this Job cannot be applied as-is.
+#
+# Verification plan phases 1, 2 and 4 for google/gemma-4-E4B on ONE RTX PRO 6000
+# (g4-standard-48), the machine shape the customer measured on. Logic and variant list
+# are in scripts/run_verify.sh.
+#
+# Apply (from the repo root):
+#   kubectl create configmap e4b-verify-scripts \
+#     --from-file=gemma-4-E4B/g4/verify/scripts/ --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl apply -f gemma-4-E4B/g4/verify/gemma-4-e4b-g4-1gpu-verify.yaml
+#
+# This cluster has no gcs-key secret, so results stay in the pod. When progress.log says
+# ALL DONE:
+#   POD=$(kubectl get pods -l job-name=gemma-4-e4b-g4-1gpu-verify -o name | head -1)
+#   kubectl cp ${POD#pod/}:/workspace/output gemma-4-E4B/g4/verify/results
+#   kubectl exec ${POD#pod/} -- touch /workspace/output/RELEASE
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gemma-4-e4b-g4-1gpu-verify
+spec:
+  backoffLimit: 0
+  # ~65 min of work plus a 90 min copy-out window, with headroom for slow startups.
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 172800
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-rtx-pro-6000"
+        cloud.google.com/gke-nodepool: "g4-48-spot-pool"
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: verify
+        # Pinned digest = vllm/vllm-openai:nightly as of 2026-10-06T06:32Z, so every variant
+        # here (and any follow-up 8-GPU rerun) uses the same build. Note the original 8-GPU
+        # sweep ran on the 2026-09-14 nightly.
+        image: vllm/vllm-openai@sha256:bcee860ca68b70b3e7f666ab3dedb5932c89d901f56d1a29b302ec08f9569884
+        command: ["bash", "/scripts/run_verify.sh"]
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        # Same as the original manifest.
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: "spawn"
+        - name: VLLM_LOGGING_LEVEL
+          value: "INFO"
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+          requests:
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+        - name: output
+          mountPath: /workspace/output
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: scripts
+        configMap:
+          name: e4b-verify-scripts
+      - name: output
+        emptyDir: {}
+      # The checkpoint is ~16 GB; g4-standard-48 has ~166 GiB allocatable.
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 40Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi

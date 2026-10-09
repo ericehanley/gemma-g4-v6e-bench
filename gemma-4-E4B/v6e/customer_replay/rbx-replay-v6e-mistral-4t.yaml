@@ -1,0 +1,122 @@
+# Job for the idle on-demand ct6e-standard-4t node in cluster pm-mistral-vllm (us-east5-b): single-chip server pinned to chip 0.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rbx-replay-v6e
+  namespace: rbx-bench
+spec:
+  backoffLimit: 0
+  # up to ~40 min first start (XLA compile) + ~2 h of steps + a 90 min copy-out window.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: rbx-replay-v6e
+    spec:
+      serviceAccountName: rbx-bench
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      nodeSelector:
+        # Pool is selectable (all ct6e-standard-1t, autoscale 0->1, us-central1-a/b/c):
+        #   v6e-1t-flex  flex-start (DWS); needs the gke-flex-start selector below   <- default
+        #   v6e-1t-spot  spot: the first attempt's node was preempted 30 min in
+        #   v6e-1t-od    on-demand: scale-up failed with "Invalid Reservation" (no on-demand quota/reservation)
+        cloud.google.com/gke-nodepool: "mistral-vllm-np"
+        cloud.google.com/gke-tpu-accelerator: "tpu-v6e-slice"
+        # Required by GKE Warden for any TPU request; 1x1 is the single-host ct6e-standard-1t topology.
+        cloud.google.com/gke-tpu-topology: "2x2"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: replay
+        # vllm/vllm-tpu:nightly as of 2026-10-06T07:20Z = nightly-20261006-f5c194c-72e7874
+        # (tpu-inference f5c194c, vLLM 72e7874); the digest already pinned in ../../v6e_clean/.
+        image: vllm/vllm-tpu@sha256:625fd3f7bc4a79dab6489dd42e5f31a3679bad569433eeecd0bad30bb41d23c4
+        command: ["bash", "/scripts/run_replay_v6e.sh"]
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        # The customer's environment, verbatim (harmless on TPU; kept so the deviation list is short).
+        - name: OMP_NUM_THREADS
+          value: "8"
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:True"
+        # TPU server env, same as the earlier v6e manifests (gemma-4-E4B/gemma-4-e4b-tp1-dp8*.yaml).
+        - name: USE_BATCHED_RPA_KERNEL
+          value: "1"
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "3600"
+        - name: SLICE_ROPE_CACHE
+          value: "true"
+        # So `--middleware=gdm_binary_probability.GdmBinaryProbabilityMiddleware` imports from /scripts.
+        # Single-chip server on a 4-chip host: pin libtpu to chip 0 (what vLLM multiprocess-DP does per rank).
+        - name: TPU_VISIBLE_CHIPS
+          value: "0"
+        - name: TPU_PROCESS_BOUNDS
+          value: "1,1,1"
+        - name: TPU_CHIPS_PER_PROCESS_BOUNDS
+          value: "1,1,1"
+        - name: PYTHONPATH
+          value: /scripts
+        - name: MODEL
+          value: google/gemma-4-E4B-it
+        # Bookkeeping only (versions.txt / progress.log).
+        - name: IMAGE_REF
+          value: "vllm/vllm-tpu@sha256:625fd3f7bc4a79dab6489dd42e5f31a3679bad569433eeecd0bad30bb41d23c4 (nightly-20261006-f5c194c-72e7874)"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+          readOnly: true
+        - name: output
+          mountPath: /workspace/output
+        - name: data
+          mountPath: /data
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: scripts
+        configMap:
+          name: rbx-replay-v6e-scripts
+          defaultMode: 0555
+      - name: output
+        emptyDir: {}
+      # Dataset and rendered prompts: RAM only, gone with the pod.
+      - name: data
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+      # The checkpoint is ~16 GB; ct6e-standard-1t has 176 GiB of RAM.
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 40Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi

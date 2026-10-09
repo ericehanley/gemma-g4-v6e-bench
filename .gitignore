@@ -1,13 +1,15 @@
-csv_results/
-guidellm/
-ignore/
-logs/
-manifests/
-results/
+# Local environment / editor junk
 venv/
-vllm/
 .DS_Store
-gcs-key.json
+__pycache__/
+*.pyc
 
-# Raw result exports
+# Credentials — never commit
+gcs-key.json
+*.key.json
+
+# Raw benchmark data stays out of git (kept locally by the operator; contains no text, only
+# counts/latencies/scores): per-request samples, cpu/gpu/tpu telemetry, server logs,
+# steps.jsonl, Prometheus snapshots, tie-back JSON, and the flat CSV exports.
+gemma-4-E4B/*/customer_replay/results_*/
 *.csv
